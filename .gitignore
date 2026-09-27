@@ -1,0 +1,12 @@
+evidence/
+node_modules/
+dist/
+dist-dev/
+.angular/
+out-tsc/
+results/
+*.log
+*.zip
+.claude/
+ANGULAR-ISSUE.md
+BUGHUNTER-REPORT.md

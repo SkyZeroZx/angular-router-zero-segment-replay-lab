@@ -1,0 +1,140 @@
+services:
+  app:
+    build:
+      context: ./app
+      args:
+        ROUTER_PATCH: ${ROUTER_PATCH:-none}
+        BUILD_CONFIG: ${BUILD_CONFIG:-production}
+    # Pinned to Node's own default header size, so it is on the record that
+    # nothing was raised to make the request acceptable: every payload here fits
+    # it, proxy headers included.
+    command: ["node", "--max-old-space-size=${HEAP_MB:-256}", "--max-http-header-size=${MAX_HTTP_HEADER_SIZE:-16384}", "dist/router-replay-e2e/server/server.mjs"]
+    environment:
+      # Per-invocation delay of the async canActivateChild on /guarded. Ignored
+      # by every other shape.
+      CANACTIVATECHILD_MS: ${CANACTIVATECHILD_MS:-0}
+      ROUTER_RESOURCES: ${ROUTER_RESOURCES:-0}
+      # The internal service the /resolved shape queries. Empty means the
+      # resolver returns synchronously and no second process is involved.
+      BACKEND_URL: ${BACKEND_URL:-}
+    ports:
+      - "127.0.0.1:${APP_PORT:-4000}:4000"
+    # Well above the V8 limit, so a kill is V8 reaching --max-old-space-size and
+    # not the kernel reaping the container. Checked via OOMKilled after a run.
+    mem_limit: ${CONTAINER_MEM_LIMIT:-3g}
+    # The cores this worker may use. Lanes running side by side pin disjoint
+    # sets, so a measurement of CPU time is not a measurement of how many other
+    # lanes happened to be busy. Unset means every core, which is what a single
+    # sequential run gets and is NOT comparable with a pinned one.
+    cpuset: ${APP_CPUSET:-}
+    restart: "no"
+    networks: [lab]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # The service behind the SSR tier: a database, an internal API, whatever the
+  # application resolver talks to. It is the second victim, and the one with no
+  # attacker-controlled identifier anywhere in the traffic it receives.
+  backend:
+    build: ./backend
+    environment:
+      # What one query costs. An ordinary indexed lookup across a network hop.
+      BACKEND_MS: ${BACKEND_MS:-250}
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-5000}:5000"
+    restart: "no"
+    networks: [lab]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch(\"http://127.0.0.1:5000/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  nginx:
+    build: ./nginx
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      NGINX_ENVSUBST_FILTER: "^NGINX_(LARGE_HEADER_BUFFER|LARGE_HEADER_BUFFER_COUNT|PROXY_BUFFER)$"
+      # The AWS Elastic Load Balancer request line. Nginx's own default is 8k,
+      # which rejects the 16 KiB path outright.
+      NGINX_LARGE_HEADER_BUFFER: ${NGINX_LARGE_HEADER_BUFFER:-16k}
+      # Nginx's own default is 4, which resets concurrent 15 KB request lines
+      # and makes a dropped burst look like a surviving worker.
+      NGINX_LARGE_HEADER_BUFFER_COUNT: ${NGINX_LARGE_HEADER_BUFFER_COUNT:-256}
+      # Big enough for the 302 Location the app returns, which echoes the URL.
+      NGINX_PROXY_BUFFER: ${NGINX_PROXY_BUFFER:-32k}
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${NGINX_PORT:-8080}:8080"
+    restart: "no"
+    networks: [lab]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/nginx-health || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  candidate:
+    profiles: ["test"]
+    build: ./client
+    environment:
+      MODE: candidate
+      SHAPE: ${SHAPE:-dashboard}
+      OUTLET: ${OUTLET:-detail}
+      BRANCHES: ${BRANCHES:-2}
+      DEPTH: ${DEPTH:-9}
+      PRIM: ${PRIM:-0}
+      FLAT: ${FLAT:-0}
+      FLAT_ROOT: ${FLAT_ROOT:-0}
+      NO_SEP: ${NO_SEP:-0}
+      CONCURRENCY: ${CONCURRENCY:-1}
+      HEAP_MB: ${HEAP_MB:-256}
+      CANACTIVATECHILD_MS: ${CANACTIVATECHILD_MS:-0}
+      ROUTER_RESOURCES: ${ROUTER_RESOURCES:-0}
+      TARGET_URL: ${TARGET_URL:-http://app:4000}
+      PROBE: ${PROBE:-1}
+      PROBE_AFTER_MS: ${PROBE_AFTER_MS:-250}
+      # Follow the redirect to the rendered page, so arms can be compared on
+      # their output. Off by default: a second request would change what the
+      # concurrency arms measure.
+      FOLLOW: ${FOLLOW:-0}
+      REQUEST_TIMEOUT_MS: ${REQUEST_TIMEOUT_MS:-600000}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks: [lab]
+
+  control:
+    profiles: ["test"]
+    build: ./client
+    environment:
+      MODE: ${CONTROL_MODE:-control}
+      SHAPE: ${SHAPE:-dashboard}
+      OUTLET: ${OUTLET:-detail}
+      BRANCHES: ${BRANCHES:-2}
+      DEPTH: ${DEPTH:-9}
+      PRIM: ${PRIM:-0}
+      FLAT: ${FLAT:-0}
+      FLAT_ROOT: ${FLAT_ROOT:-0}
+      NO_SEP: ${NO_SEP:-0}
+      CONCURRENCY: ${CONCURRENCY:-1}
+      HEAP_MB: ${HEAP_MB:-256}
+      CANACTIVATECHILD_MS: ${CANACTIVATECHILD_MS:-0}
+      ROUTER_RESOURCES: ${ROUTER_RESOURCES:-0}
+      TARGET_URL: ${TARGET_URL:-http://app:4000}
+      PROBE: ${PROBE:-1}
+      PROBE_AFTER_MS: ${PROBE_AFTER_MS:-250}
+      FOLLOW: ${FOLLOW:-0}
+      REQUEST_TIMEOUT_MS: ${REQUEST_TIMEOUT_MS:-600000}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks: [lab]
+
+networks:
+  lab: {}

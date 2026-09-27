@@ -1,0 +1,59 @@
+worker_processes auto;
+
+events {
+  worker_connections 1024;
+}
+
+http {
+  access_log off;
+  error_log /dev/stderr notice;
+  server_tokens off;
+
+  # Sized to the AWS Elastic Load Balancer request line. Nginx's own default is
+  # 8k, which rejects the 16 KiB path outright.
+  #
+  # The COUNT matters as much as the size and is easy to get wrong. At Nginx's
+  # own default of 4, a burst of concurrent 15 KB request lines runs out of
+  # large header buffers and the connections are reset. That reads as the worker
+  # surviving the burst, when in fact the burst never arrived.
+  large_client_header_buffers ${NGINX_LARGE_HEADER_BUFFER_COUNT} ${NGINX_LARGE_HEADER_BUFFER};
+
+  upstream angular_ssr {
+    server app:4000;
+    keepalive 32;
+  }
+
+  server {
+    listen 8080 default_server;
+    server_name _;
+
+    location = /nginx-health {
+      return 204;
+    }
+
+    location / {
+      proxy_pass http://angular_ssr;
+
+      # Angular's Express server receives HTTP/1.1 over a reused upstream
+      # connection, matching a typical Nginx reverse-proxy deployment.
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_set_header X-Forwarded-Proto $scheme;
+
+      # Recognition that succeeds ends on a redirect whose Location echoes the
+      # merged URL, so the response header is as long as the request line. At
+      # Nginx's one-page default every proxied response comes back 502 with
+      # "upstream sent too big header" instead of the app's own status. This is
+      # on the RESPONSE path: it changes what the client sees, never what the
+      # server is willing to accept.
+      proxy_buffer_size ${NGINX_PROXY_BUFFER};
+      proxy_buffers 4 ${NGINX_PROXY_BUFFER};
+
+      proxy_connect_timeout 5s;
+      proxy_send_timeout 600s;
+      proxy_read_timeout 600s;
+    }
+  }
+}
