@@ -4,12 +4,10 @@
 //
 //   count        report what recognition built and what the tree walk cost:
 //                nodes created, and steps taken by findNode()/findPath()
-//   ungate       run checkOutletNameUniqueness() in production too. One line.
-//   memo         index the snapshot tree by identity instead of searching it
-//                from the root on every getter access
-//   share-query  create and freeze the query map once per recognition and share
-//                it, the transformation from angular/angular#70933
-//   ungate       call checkOutletNameUniqueness() in production too
+//   ungate       run checkOutletNameUniqueness() in production too, at the call
+//                site it has today. Closes the nested replay and leaves the
+//                flat variant open, which is why it is an ablation and not the
+//                fix. The fix is patch-zero-segment.mjs.
 
 import { readFileSync, writeFileSync } from "node:fs";
 
@@ -93,35 +91,6 @@ function applyOne(source, what, anchor, replacement) {
   return source.replace(anchor, replacement);
 }
 
-const PR_INHERITED_ANCHOR = `    inherited = {
-      params: {
-        ...parent.params,
-        ...route.params
-      },
-      data: {
-        ...parent.data,
-        ...route.data
-      },`;
-
-// The same two hunks the PR applies there: reuse the parent's frozen params
-// when the route contributes none of its own, and freeze what is built.
-const PR_INHERITED_FIXED = `    inherited = {
-      params: Object.keys(route.params).length === 0 ? parent.params : Object.freeze({
-        ...parent.params,
-        ...route.params
-      }),
-      data: Object.freeze({
-        ...parent.data,
-        ...route.data
-      }),`;
-
-// createSnapshot() freezes the inherited maps today; the PR moves that into
-// getInherited() and stops doing it twice.
-const PR_SNAPSHOT_ANCHOR = `    snapshot.params = Object.freeze(inherited.params);
-    snapshot.data = Object.freeze(inherited.data);`;
-const PR_SNAPSHOT_FIXED = `    snapshot.params = inherited.params;
-    snapshot.data = inherited.data;`;
-
 const MODES = {
   count: (s) => addCounters(s),
 
@@ -142,22 +111,10 @@ const MODES = {
   // and share it, instead of copying it into every snapshot. Keyed on the
   // urlTree identity so an absolute redirect that replaces the tree gets a new
   // map. Both copy sites, same transformation.
-  // angular/angular#70933 in full, as three edits: one frozen query map shared
-  // by every snapshot, the parent's params reused when the route adds none, and
-  // the double freeze in createSnapshot() removed. An earlier revision applied
-  // only the first and understated what the PR does.
-  "share-query": (s) => {
-    const q = "Object.freeze({\n      ...this.urlTree.queryParams\n    })";
-    if (s.split(q).length - 1 !== 2) {
-      throw new Error("share-query: expected exactly 2 query copy sites.");
-    }
-    let out = s.split(q).join(
-      "(this.__sqSource === this.urlTree.queryParams ? this.__sharedQueryParams : (this.__sqSource = this.urlTree.queryParams, this.__sharedQueryParams = Object.freeze({\n      ...this.urlTree.queryParams\n    })))",
-    );
-    out = applyOne(out, "getInherited", PR_INHERITED_ANCHOR, PR_INHERITED_FIXED);
-    out = applyOne(out, "the double freeze in createSnapshot", PR_SNAPSHOT_ANCHOR, PR_SNAPSHOT_FIXED);
-    return out;
-  },
+  // angular/angular#70933 in full: one frozen query map shared by every
+  // snapshot, the parent's params reused when the route adds none, both
+  // getInherited branches freezing what they build, and the double freeze in
+  // createSnapshot() removed.
 
 };
 

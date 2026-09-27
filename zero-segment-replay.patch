@@ -1,0 +1,134 @@
+diff --git a/packages/core/test/bundling/router/bundle.golden_symbols.json b/packages/core/test/bundling/router/bundle.golden_symbols.json
+index f7eeb4d..2ed1911 100644
+--- a/packages/core/test/bundling/router/bundle.golden_symbols.json
++++ b/packages/core/test/bundling/router/bundle.golden_symbols.json
+@@ -455,6 +455,7 @@
+       "captureError",
+       "catchError",
+       "checkGuards",
++      "checkOutletNameUniqueness",
+       "checkSecurityContext",
+       "checkStable",
+       "classIndexOf",
+diff --git a/packages/router/src/recognize.ts b/packages/router/src/recognize.ts
+index 0af4e5d..507caff 100644
+--- a/packages/router/src/recognize.ts
++++ b/packages/router/src/recognize.ts
+@@ -223,11 +223,6 @@ export class Recognizer {
+     // multiple activated results for the same outlet. We should merge the children of
+     // these results so the final return value is only one `TreeNode` per outlet.
+     const mergedChildren = mergeEmptyPathMatches(children);
+-    if (typeof ngDevMode === 'undefined' || ngDevMode) {
+-      // This should really never happen - we are only taking the first match for each
+-      // outlet and merge the empty path matches.
+-      checkOutletNameUniqueness(mergedChildren);
+-    }
+     sortActivatedRouteSnapshots(mergedChildren);
+     return mergedChildren;
+   }
+@@ -580,11 +575,14 @@ function mergeEmptyPathMatches(
+     const mergedChildren = mergeEmptyPathMatches(mergedNode.children);
+     result.push(new TreeNode(mergedNode.value, mergedChildren));
+   }
+-  return result.filter((n) => !mergedNodes.has(n));
++  const merged = result.filter((n) => !mergedNodes.has(n));
++  checkOutletNameUniqueness(merged);
++  return merged;
+ }
+ 
+ function checkOutletNameUniqueness(nodes: TreeNode<ActivatedRouteSnapshot>[]): void {
+-  const names: {[k: string]: ActivatedRouteSnapshot} = {};
++  // `Object.create(null)` because an outlet may be named after an `Object.prototype` member.
++  const names: {[k: string]: ActivatedRouteSnapshot} = Object.create(null);
+   nodes.forEach((n) => {
+     const routeWithSameOutletName = names[n.value.outlet];
+     if (routeWithSameOutletName) {
+diff --git a/packages/router/test/recognize.spec.ts b/packages/router/test/recognize.spec.ts
+index 95ec237..ee3ef6a 100644
+--- a/packages/router/test/recognize.spec.ts
++++ b/packages/router/test/recognize.spec.ts
+@@ -647,6 +647,84 @@ describe('recognize', () => {
+     });
+   });
+ 
++  describe('duplicate outlets', () => {
++    const config: Routes = [
++      {
++        path: 'a',
++        component: ComponentA,
++        children: [{path: ':id', outlet: 'detail', component: ComponentB}],
++      },
++    ];
++
++    function withNgDevMode<T>(value: unknown, fn: () => T): T {
++      const previous = (globalThis as any).ngDevMode;
++      (globalThis as any).ngDevMode = value;
++      try {
++        return fn();
++      } finally {
++        (globalThis as any).ngDevMode = previous;
++      }
++    }
++
++    // A parenthesised group that consumes no segments is passed to
++    // `processChildren` with the same config, so the same route matches once per
++    // group and every match lands in one sibling array under one outlet name.
++    it('rejects duplicates when ngDevMode is off', async () => {
++      await withNgDevMode(false, () =>
++        expectAsync(recognize(config, 'a/(detail:1//x:/(detail:1))')).toBeRejected(),
++      );
++    });
++
++    // `mergeEmptyPathMatches` moves the children of duplicate empty path nodes
++    // under one node. Those children are the duplicates, and they are created
++    // below the level the caller validated.
++    it('rejects duplicates that only appear once empty path matches are merged', async () => {
++      const merging: Routes = [
++        {
++          path: '',
++          component: ComponentA,
++          children: [
++            {path: ':id', component: ComponentB},
++            {path: '', outlet: 'side', component: ComponentC},
++          ],
++        },
++      ];
++      await expectAsync(recognize(merging, '(a:1//b:1//c:1)')).toBeRejected();
++    });
++
++    // An outlet may legitimately be named after an `Object.prototype` member.
++    // With a plain object as the seen-names map, one such outlet reads back an
++    // inherited value and is rejected as a duplicate of itself.
++    it('accepts an outlet named after an Object.prototype member', async () => {
++      const named: Routes = [
++        {
++          path: 'a',
++          component: ComponentA,
++          children: [{path: ':id', outlet: 'constructor', component: ComponentB}],
++        },
++      ];
++      await withNgDevMode(false, async () => {
++        const s = await recognize(named, 'a/(constructor:1)');
++        expect(s.root.firstChild!.children.length).toBe(1);
++      });
++    });
++
++    it('accepts distinct outlet names', async () => {
++      const distinct: Routes = [
++        {
++          path: 'a',
++          component: ComponentA,
++          children: [
++            {path: ':id', outlet: 'detail', component: ComponentB},
++            {path: ':id', outlet: 'aside', component: ComponentC},
++          ],
++        },
++      ];
++      const s = await recognize(distinct, 'a/(detail:1//aside:2)');
++      expect(s.root.firstChild!.children.length).toBe(2);
++    });
++  });
++
+   describe('wildcards', () => {
+     it('should support simple wildcards', async () => {
+       const s = await recognize([{path: '**', component: ComponentA}], 'a/b/c/d;a1=11');

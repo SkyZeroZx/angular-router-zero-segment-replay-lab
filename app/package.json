@@ -5,7 +5,15 @@
   "type": "module",
   "scripts": {
     "build": "ng build",
-    "build:dev": "ng build --configuration development"
+    "build:dev": "ng build --configuration development",
+    "patch:70933": "node patch-70933.mjs",
+    "patch:zero-segment": "node patch-zero-segment.mjs",
+    "patch:status": "node patch-70933.mjs status && node patch-zero-segment.mjs status",
+    "patch:reset": "node patch-70933.mjs revert && node patch-zero-segment.mjs revert",
+    "build:stock": "npm run patch:reset && ng build",
+    "build:70933": "npm run patch:reset && npm run patch:70933 && ng build",
+    "build:zero-segment": "npm run patch:reset && npm run patch:zero-segment && ng build",
+    "build:both": "npm run patch:reset && npm run patch:70933 && npm run patch:zero-segment && ng build"
   },
   "dependencies": {
     "@angular/common": "22.2.0",

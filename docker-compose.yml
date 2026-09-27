@@ -5,6 +5,9 @@ services:
       args:
         ROUTER_PATCH: ${ROUTER_PATCH:-none}
         BUILD_CONFIG: ${BUILD_CONFIG:-production}
+        # The two fixes, independently switchable. 0/0 is stock.
+        PATCH_70933: ${PATCH_70933:-0}
+        PATCH_ZERO_SEGMENT: ${PATCH_ZERO_SEGMENT:-0}
     # Pinned to Node's own default header size, so it is on the record that
     # nothing was raised to make the request acceptable: every payload here fits
     # it, proxy headers included.
