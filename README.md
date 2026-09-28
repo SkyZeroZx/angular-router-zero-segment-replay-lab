@@ -9,8 +9,8 @@ Control:   /dashboard/(detail:1//x:/(detail:1//x:/(...)//x:/(...))//x:/(...))   
 ```
 
 Both URLs are 15,349 bytes and declare the same 1,023 parenthesised groups. They
-differ only in how many distinct outlet names the siblings of a group carry.
-Eight candidate requests exhaust a 128 MiB SSR worker. The control answers and the
+differ only in how many distinct outlet names the siblings of a group carry. Six
+candidate requests exhaust a 128 MiB SSR worker. The control answers and the
 worker stays up.
 
 The URL pays for each group once. The Router pays for the group count times the
@@ -75,9 +75,15 @@ contains, plus the flat shape from "A second way" below:
 ./scripts/validate.sh dashboard
 ```
 
+One request against a byte-identical control first, since that part needs no
+burst at all. Then a climb from one request up to whatever count takes the worker
+past its heap limit. It prints that count instead of asserting a particular one.
+
 Each trial recreates the container, checks the worker's command line for the heap
 it was supposed to get, and greps the running worker's copy of the bundle for the
-markers the requested build must and must not carry. Logs go to `evidence/`.
+markers the requested build must and must not carry. If the burst never reached
+the worker, the trial is refused instead of being written down as a worker that
+withstood it. Logs go to `evidence/`.
 
 ```bash
 ./scripts/validate.sh counts     # what recognition builds
@@ -85,35 +91,46 @@ markers the requested build must and must not carry. Logs go to `evidence/`.
 ./scripts/validate.sh matrix     # request-line sizes and heaps
 ./scripts/validate.sh devprod    # development against production
 ./scripts/validate.sh ablation   # stock against each proof-only edit
+./scripts/validate.sh fixcheck   # the two patches, side by side
+./scripts/validate.sh resources  # withRouterResources(), the flat variant
 ./scripts/validate.sh fuzz       # the payload grid
 ./scripts/validate.sh backend    # what one request does to the service behind it
 ```
 
 A trial is refused, not reported, when the burst never reached the worker: a 431
-on the request line, or requests missing while `/health` answered fast. Both
-produced numbers here that read as a worker withstanding load.
+on the request line, or requests missing while `/health` answered fast or did not
+answer at all. A DNS failure takes seconds, so a slow probe alone is not evidence
+the worker was loaded; the probe has to come back 200. Each of these produced a
+number here that read as a worker withstanding load.
 
 ## What recognition builds
 
 `ROUTER_PATCH=count` instruments `createSnapshot()` and nothing else. One request
 at the 8 KiB payload, 511 groups:
 
-| Arm                                 | Bytes |      Nodes |
-| ----------------------------------- | ----: | ---------: |
-| `dashboard`, fan-out 1              | 7,161 |      1,024 |
-| `nested`, fan-out 2                 | 7,158 |      2,046 |
-| `nested2`, fan-out 4                | 7,159 |      4,090 |
-| `nested3`, fan-out 13               | 7,159 | **13,288** |
-| `master`, fan-out 13 + primary      | 8,691 | **26,574** |
-| control, byte-identical             | 7,159 |    **236** |
-| no named outlet in the replayed set | 4,092 |      **4** |
+| Arm                                 | Bytes |      Nodes |       Tree steps |
+| ----------------------------------- | ----: | ---------: | ---------------: |
+| `dashboard`, fan-out 1              | 7,671 |      1,024 |          659,205 |
+| `nested`, fan-out 2                 | 7,668 |      2,046 |        2,624,000 |
+| `nested2`, fan-out 4                | 7,669 |      4,090 |       10,470,405 |
+| `nested3`, fan-out 13               | 7,669 | **13,288** | **110,406,675** |
+| `master`, fan-out 13 + primary      | 9,201 | **26,574** |      441,460,583 |
+| control, byte-identical             | 7,669 |    **236** |       **35,700** |
+| no named outlet in the replayed set | 4,092 |      **8** |               15 |
 
 ```text
 nodes = 2 * groups * matched_per_group * fan_out + 2
 ```
 
-Exact in every row. `createSnapshot()` runs twice per match, so the tree is half
-of that.
+One request at 7,669 bytes builds 13,288 snapshots and walks 110,406,675 tree
+steps. The control is the same length to the byte and builds 236, walking
+35,700. That pair is the finding. Everything below is how far it goes.
+
+Exact in every row, with `groups` read per row: 511 for the replayed URLs, and
+`depth + 1` for the control, which is the point of the control. `createSnapshot()`
+runs twice per match, and the root snapshot is built directly
+(`_router-chunk.mjs:3056`) rather than through it, so the retained tree is half of
+the count plus one.
 
 Seven is not a correct number either — the control's `depth + 1`. A legitimate
 URL declares one group and activates one route. The smallest misbehaving case is
@@ -130,47 +147,37 @@ The last row is the precondition: with no named outlet in the replayed set,
 ```
 
 Lowest concurrency that takes the worker past its heap limit, climbing from 1,
-fresh worker per trial, `OOMKilled=false` on every kill:
+fresh worker per trial, `OOMKilled=false` on every kill. All six cells come from
+one run, straight at the worker, two dedicated cores each, no proxy. The 8 KB
+worker at 512 MiB survived forty requests and I stopped the climb there, so that
+cell is a floor and not a count.
 
-| Request line | 128 MiB | 256 MiB | 512 MiB |
-| -----------: | ------: | ------: | ------: |
-|      7,669 B |  **10** |  **20** |  **49** |
-|     15,349 B |   **8** |  **11** |  **20** |
+|   Path bytes | 128 MiB | 256 MiB |  512 MiB |
+| -----------: | ------: | ------: | -------: |
+|      7,669 B |  **10** |  **20** | **> 40** |
+|     15,349 B |   **6** |  **10** |   **20** |
 
-The 16 KB payload is the efficient one as the heap grows. At 128 MiB the 8 KB
-one costs less total traffic to get there: 77 KB against 123 KB.
+At 128 MiB the 8 KB payload gets there for less traffic, 77 KB against 92 KB. At
+512 MiB the two land within a few KB of each other. Neither size wins across the
+range.
 
-An async `canActivateChild` needs 5 requests at 128 MiB instead of 8, and 11 at
-256 MiB, which is what the configuration without it needs. The hook lowers the
-floor; it is not what makes this fatal.
+An async `canActivateChild` lowers the floor by a request or two. It is not what
+makes this fatal. Those numbers came from an earlier run on a different CPU
+regime, so they are not in the grid above.
 
-Counts move by a request or two between runs, here and in the tables below.
+Counts move by a request or two between runs, here and below. Fatality is also
+not monotone in the request count: 16 KiB against a 128 MiB worker is fatal at 6
+and at 8, and healthy at 16 and at 64. A big enough burst stops arriving together
+and gets recognised one request at a time. So each cell is the lowest count that
+killed the worker on a climb from 1, not a line above which it always dies.
 
 More memory does not halve the exposure, and every count here is small enough
-that no rate limit tells the burst from ordinary traffic. At 128 MiB the 8 KB
-payload costs less total traffic to get there, 77 KB against 123 KB; at 512 MiB
-the 16 KB one is 2.5x more efficient. Heaps above 512 MiB were not measured.
+that no rate limit tells the burst from ordinary traffic. Heaps above 512 MiB
+were not measured.
 
 The fan-out belongs to the application and costs the attacker nothing: on the
-same request, a bare panel builds 2,048 nodes and three panels of three widgets
-build 26,600.
-
-## A note on Nginx
-
-The lab ships an Nginx service, but no cell here is measured through it. This
-configuration serialises the upstream requests: sixteen concurrent ones finished
-7.9 seconds apart, 8067, 15535, 23289 ... 126788 ms, one request's cost each in a
-queue. Straight at the worker the same sixteen finish within 4 ms.
-
-Through this configuration the proxy serialises the upstream requests. Sixteen
-concurrent requests finished 7.9 seconds apart — 8067, 15535, 23289 … 126788 ms —
-one request's cost each, in a queue. Straight at the worker the same sixteen
-finish within 4 ms of one another. So proxied cells measure the proxy's queue,
-not the Router: the worker never holds more than one snapshot tree.
-
-Add a resolver and that stops. `/live` is `nested3` with one, and through the
-same proxy it is fatal at 8. Whether the burst arrives together is a property of
-the deployment, not of the Router.
+same 15,349-byte request, a bare panel builds 2,048 nodes where three panels of
+three widgets build 26,600.
 
 ## A second way to the same missing check
 
@@ -192,26 +199,28 @@ outlet the URL declares. That inflation is
 ```
 
 With `withRouterResources()` enabled, each duplicated instance costs one factory
-and its loaders. Three resources on 300 ms timers, `ROUTER_RESOURCES=1`:
+and its loaders. Three resources on 300 ms timers. Loaders that resolve
+immediately kill nothing, so the wait is what makes this cost.
 
-| Request line | Outlets |    Heap | Requests | stock      | #70933 applied |
+```bash
+./scripts/validate.sh resources
+```
+
+|   Path bytes | Outlets |    Heap | Requests | stock      | #70933 applied |
 | -----------: | ------: | ------: | -------: | ---------- | -------------- |
 |      7,995 B |   1,246 | 256 MiB |        5 | **V8 OOM** | **V8 OOM**     |
 |     16,073 B |   2,400 | 256 MiB |        3 | **V8 OOM** | **V8 OOM**     |
 |      7,995 B |   1,246 | 512 MiB |       12 | **V8 OOM** | **V8 OOM**     |
 |     16,073 B |   2,400 | 512 MiB |        8 | **V8 OOM** | **V8 OOM**     |
 
-Loaders that resolve immediately kill nothing, so the 300 ms wait is what makes
-this cost.
-
 `withRouterResources()` is developer preview and opt-in, so an application that
 has not enabled it is outside this.
 
-What matters is that ungating `:3100` does **not** close this one:
-`mergeEmptyPathMatches` creates those duplicates one level below where that call
-runs, so the check has to run after the merge as well. That was measured
-elsewhere, not here: with both call sites these four cells answer 404 and the
-worker lives.
+The point of the variant is where the check has to go. Ungating `:3100` does
+**not** close it: `checkOutletNameUniqueness` already runs after
+`mergeEmptyPathMatches`, but only over the merged siblings, and the duplicates
+the merge produces sit among the children it moves under one of them. Checking
+those recursively closes both. That is what `zero-segment-replay.patch` does.
 
 ## Only in production
 
@@ -232,11 +241,11 @@ Same application, same URL, same heap, four requests:
 In development the application is protected. Nothing run locally, and no unit
 test, shows this.
 
-```bash
-$ grep -rl "checkOutletNameUniqueness" app/dist/router-replay-e2e/server/   # no match
-$ grep -rl "checkOutletNameUniqueness" app/dist-dev/server/
-app/dist-dev/server/main.server.mjs
-```
+Grepping for the identifier proves nothing, since minification renames it either
+way. NG04006's numeric code survives, and 4006 appears only in that function's
+throw: once in the development bundle, never in the optimized one. It is gone by
+position too — in the minified `processChildren`, `mergeEmptyPathMatches` is
+followed straight by `sortActivatedRouteSnapshots`, with nothing in between.
 
 ## What the budget buys
 
@@ -278,7 +287,7 @@ queries. `/resolved` is the four-line configuration with a resolver on it.
 
 One request, fan-out 1, so every query is one replayed group:
 
-|     Request line | Groups | Queries | Worker slot held | Peak in flight |
+|       Path bytes | Groups | Queries | Worker slot held | Peak in flight |
 | ---------------: | -----: | ------: | ---------------: | -------------: |
 |            230 B |     15 |  **15** |         3,924 ms |              1 |
 |            950 B |     63 |  **63** |        15,994 ms |              1 |
@@ -286,43 +295,116 @@ One request, fan-out 1, so every query is one replayed group:
 | 1,910 B, control |    127 |   **7** |         1,927 ms |              1 |
 
 Queries equal groups at every size. Peak in flight is 1, which is
-`resolveData()`'s `concatMap` measured rather than asserted.
+`resolveData()`'s `concatMap` measured rather than asserted — and it bounds the
+rate as well as the count: 127 queries over 32 s is about 4 per second, so one
+request does not bury anything. The amplification is 18x the control's 7, and it
+is per request; the load scales with concurrency.
 
-The worker stays healthy and `/health` answers 200 throughout, so the failure
-shows up on the database. What reaches it comes from the SSR tier's own address
-with its own credentials and carries nothing attacker-controlled, and the client
-gets a 302 with a 20-byte `Location`. Nothing correlates the two. Only `resolve`
-was measured.
+What one request does buy reliably is the worker slot and the connection, held
+for those 32 seconds while `/health` still answers 200. What reaches the service
+comes from the SSR tier's own address with its own credentials and carries
+nothing attacker-controlled, and the client gets a 302 with a 20-byte
+`Location`, so nothing ties the queries back to the request that caused them —
+though the 1,910-byte URI and the 32-second response are both logged. Only
+`resolve` was measured.
+
+## The two patches
+
+Each one is here twice: as a diff against `angular/angular`, and as a script
+that makes the same edit to the published bundle. The diff is what you send a
+maintainer. The script is what lets this lab build an image in minutes instead
+of compiling Angular from source.
+
+| | source diff | bundle script | switch |
+| --- | --- | --- | --- |
+| [#70933](https://github.com/angular/angular/pull/70933) | `70933.patch` | `app/patch-70933.mjs` | `PATCH_70933=1` |
+| the fix for this | `zero-segment-replay.patch` | `app/patch-zero-segment.mjs` | `PATCH_ZERO_SEGMENT=1` |
+
+Neither needs the other. They touch different functions, so you can apply one,
+both, or neither, in whatever order. Each script also takes `revert` and
+`status`, so you can move a bundle between states without reinstalling it. Both
+diffs apply cleanly to the commit #70933 is based on.
+
+```bash
+npm --prefix app run build:70933          # or build:zero-segment, build:both, build:stock
+PATCH_ZERO_SEGMENT=1 docker compose up -d --build --wait app
+./scripts/validate.sh fixcheck            # the two, side by side, plus a regression check
+```
+
+#70933 does not close this. It shares one frozen query map across snapshots and
+stops copying inherited params into each one. This attack carries no query
+parameters and no matrix parameters, so there is nothing for it to share.
+
+The fix is three edits:
+
+1. The gated call site in `processChildren` goes away.
+2. The check moves onto every list `mergeEmptyPathMatches` returns. That
+   function recurses into the children it merges, so this is the only way to
+   reach the duplicates the merge itself creates.
+3. The map of seen names becomes `Object.create(null)`.
+
+The third looks cosmetic and is not. An outlet can legitimately be called
+`constructor` or `toString`, and with a plain object a single outlet by that
+name reads back an inherited value and gets rejected as a duplicate of itself.
+Nobody hits that today, because the check does not run in production. The moment
+it does, it matters.
 
 ## Isolating it
 
-Proof-only edits to `@angular/router`, applied at image build time. `none` is
-stock, and that is what every number above uses.
+Two more edits to `@angular/router`, applied at build time. These are ablations,
+not proposals: `count` instruments `createSnapshot()` and the tree walk, and
+`ungate` calls the check at the site it already has. `ungate` closes the nested
+replay but leaves the flat variant open, which is why the fix moves the call
+instead.
 
 ```bash
-ROUTER_PATCH=count       docker compose up -d --build --wait app
-ROUTER_PATCH=ungate      docker compose up -d --build --wait app
-ROUTER_PATCH=share-query docker compose up -d --build --wait app
-```
-
-```bash
+ROUTER_PATCH=ungate docker compose up -d --build --wait app
 ./scripts/validate.sh ablation
 ```
 
 `nested3`, 15,349 bytes, four concurrent requests, 256 MiB:
 
-| Build         |   Peak RSS | Status |
-| ------------- | ---------: | -----: |
-| stock         |    296 MiB |    302 |
-| `share-query` |    273 MiB |    302 |
-| `ungate`      | **73 MiB** |    404 |
+| Build    |   Peak RSS | Status |
+| -------- | ---------: | -----: |
+| stock    |    296 MiB |    302 |
+| #70933   |    273 MiB |    302 |
+| `ungate` | **73 MiB** |    404 |
 
-#70933 does not reach this: it shares one frozen query map across snapshots, and
-this attack carries no query parameters. Ungating drops the memory to the
-worker's idle footprint, because recognition throws on the first duplicated
-sibling and the tree is never built. The check runs after the provisional
-snapshots exist, so it bounds what the tree retains, not everything recognition
-allocates.
+273 against 296 is inside the spread between runs, so #70933 moves nothing here.
+Ungating drops memory to the worker's idle footprint: recognition throws on the
+first duplicated sibling and the tree never gets built. The throw still happens
+after the provisional snapshots exist, so it bounds what the tree keeps, not
+everything recognition allocates.
+
+## Does the fix hold
+
+```bash
+HEAP_MB=512 CONCURRENCY=24 ./scripts/validate.sh fixcheck
+```
+
+24 concurrent requests at 15,349 bytes against a 512 MiB worker, which is above
+the 20 that kill it unpatched:
+
+| Build          | Attack     |   Peak RSS |  /health | Ordinary URL             |
+| -------------- | ---------- | ---------: | -------: | ------------------------ |
+| stock          | **V8 OOM** |    713 MiB | 132278ms | 200, sha 4c8b46439352a579 |
+| `zero-segment` | **404**    | **142 MiB** |  **194ms** | 200, sha 4c8b46439352a579 |
+
+Same sha on both, so the page a real user asks for renders byte for byte the
+same. That is the question worth asking first, and the answer is that the fix
+does not move it.
+
+Then the same worker at counts well past the floor, all of them 404, every
+request delivered, worker alive:
+
+| Path bytes | x24 | x32 | x48 | x64 |
+| ---------: | --- | --- | --- | --- |
+|    7,669 B | ok  | ok  | ok  | ok  |
+|   15,349 B | ok  | ok  | ok  | ok  |
+
+`/health` stays under 800 ms at 64 concurrent, against 132 seconds for stock at
+24. Recognition throws on the first duplicated sibling, so the tree is never
+built and there is nothing to collect.
 
 ## Manual test
 
@@ -349,9 +431,11 @@ lock: one measurement run at a time.
 
 ## Where this stops
 
-It needs SSR, a route with a named outlet reachable under a path, and a catch-all
-so the request survives the `@angular/ssr` route tree, which splits the path on
-`/` and would otherwise 404 first.
+It needs SSR and a route with a named outlet reachable under a path. That is the
+whole list. The first segment has to match a declared route, which `/dashboard`
+does; everything after it is the attacker's to write. Taking the lab's
+`{ path: '**' }` out changes nothing, and in any case almost every Angular
+application declares one for its 404 page.
 
 The fan-out is the application's choice and the dominant multiplier, so an
 application whose named outlet holds nothing is not worth attacking this way.

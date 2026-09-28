@@ -126,7 +126,7 @@ echo
 echo "== results =="
 for f in "$OUT"/lane*.txt; do
   [[ -f "$f" ]] || continue
-  grep -E '^(==|16k|8k|\[FAIL)' "$f" || true
+  grep -E '^(==|16k|8k|\[FAIL|\[stalled)' "$f" || true
 done
 
 # Every lane's project, torn down.

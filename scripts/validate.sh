@@ -138,18 +138,20 @@ marker_count() {
 # ROUTER_PATCH must and must not have put there. Asserting the absent ones too is
 # what keeps a stale image from passing as a fresh one.
 assert_router_patch() {
-  local want="${ROUTER_PATCH:-none}"
-  local gate index shared counted
+  local want="${BUILD_VARIANT:-${ROUTER_PATCH:-none}}"
+  local gate shared counted merged
   gate="$(marker_count '__ungatedOutletCheck')"
-  index="$(marker_count '__indexedLookup')"
   shared="$(marker_count '__sharedQueryParams')"
   counted="$(marker_count 'globalThis.__d')"
-  : "${gate:=0}" "${index:=0}" "${shared:=0}" "${counted:=0}"
+  merged="$(marker_count 'checkOutletNameUniqueness(merged)')"
+  : "${gate:=0}" "${shared:=0}" "${counted:=0}" "${merged:=0}"
   case "$want" in
-  none)        [[ $gate == 0 && $index == 0 && $shared == 0 && $counted == 0 ]] ;;
-  count)       [[ $gate == 0 && $index == 0 && $shared == 0 && $counted -gt 0 ]] ;;
-  ungate)      [[ $gate -gt 0 && $index == 0 && $shared == 0 && $counted == 0 ]] ;;
-  share-query) [[ $gate == 0 && $index == 0 && $shared -gt 0 && $counted == 0 ]] ;;
+  stock | none)  [[ $gate == 0 && $shared == 0 && $counted == 0 && $merged == 0 ]] ;;
+  count)         [[ $gate == 0 && $shared == 0 && $counted -gt 0 && $merged == 0 ]] ;;
+  ungate)        [[ $gate -gt 0 && $shared == 0 && $counted == 0 && $merged == 0 ]] ;;
+  70933)         [[ $gate == 0 && $shared -gt 0 && $counted == 0 && $merged == 0 ]] ;;
+  zero-segment)  [[ $gate == 0 && $shared == 0 && $counted == 0 && $merged -gt 0 ]] ;;
+  both)          [[ $gate == 0 && $shared -gt 0 && $counted == 0 && $merged -gt 0 ]] ;;
   *) return 1 ;;
   esac
 }
@@ -211,13 +213,17 @@ trial() {
   # before the Angular handler, so it is availability of the worker and not
   # latency of routing.
   TRIAL_BLOCK="$(grep -o '"health":{"ms":[0-9]*' "$log" | head -1 | grep -o '[0-9]*$' || true)"
+  # The probe reports the error code in place of the status when it never got an
+  # answer, so a client-side outage and a blocked worker both arrive here as a
+  # slow /health. Only a 200 means the worker was reached and answered.
+  TRIAL_HEALTH="$(grep -o '"health":{"ms":[0-9]*,"status":[^,}]*' "$log" | head -1 | sed 's/.*"status"://; s/"//g' || true)"
   # How many of the burst actually reached the application. A request the proxy
   # reset, or that Node answered 431 on the request line, never loaded the
   # worker - and a worker that was never loaded looks exactly like a worker that
   # withstood the load. Both have happened in this repository.
   TRIAL_DELIVERED="$(grep -o '"status":[0-9]*' <<<"$results" | wc -l | tr -d ' ')"
   TRIAL_SENT="$concurrency"
-  for v in TRIAL_MS TRIAL_STATUS TRIAL_SHA TRIAL_BLOCK TRIAL_BYTES; do
+  for v in TRIAL_MS TRIAL_STATUS TRIAL_SHA TRIAL_BLOCK TRIAL_BYTES TRIAL_HEALTH; do
     [[ -n "${!v}" ]] || printf -v "$v" '%s' "n/a"
   done
 
@@ -238,16 +244,24 @@ trial() {
     # Requests went missing. Which of two very different things that is depends
     # on whether the worker was under load at the time.
     #
-    # /health fast: the burst never arrived. Nginx running out of large header
-    # buffers does this, and so does Node answering 431 on the request line. The
-    # worker was never loaded, so calling it healthy would be measuring nothing.
+    # /health fast, or never answered at all: the burst never arrived. Nginx
+    # running out of large header buffers does this, so does Node answering 431
+    # on the request line, and so does the client failing to resolve the worker -
+    # a DNS failure takes seconds, which reads as a slow /health unless the
+    # status is checked too. A worker that was never loaded is not a healthy one.
     #
     # /health slow: the burst arrived and the worker shed part of it while
     # blocked. Node's own headersTimeout is 60 s, so a worker stalled longer than
     # that destroys connections whose headers it has not finished reading. That
     # is the victim failing, not the harness.
-    if [[ "$TRIAL_BLOCK" != "n/a" ]] && ((TRIAL_BLOCK >= 1000)); then
+    if [[ "$TRIAL_HEALTH" == 200 ]] && [[ "$TRIAL_BLOCK" != "n/a" ]] && ((TRIAL_BLOCK >= 1000)); then
       TRIAL_VERDICT=healthy
+    elif [[ "$TRIAL_DELIVERED" -gt 0 ]] && [[ "$TRIAL_BLOCK" != "n/a" ]] && ((TRIAL_BLOCK >= 1000)); then
+      # Part of the burst arrived and the worker then stopped answering its own
+      # health endpoint. It never reached the heap limit, so as a rung of a climb
+      # it survived - but it did not withstand the load either, and a table that
+      # calls it healthy says the opposite of what happened.
+      TRIAL_VERDICT=stalled
     else
       TRIAL_VERDICT=undelivered
     fi
@@ -283,6 +297,7 @@ repeat() {
     case "$TRIAL_VERDICT" in
     fatal) REPEAT_FATAL=$((REPEAT_FATAL + 1)) ;;
     healthy) ;;
+    stalled) echo "[stalled] ${tag} t${i}: alive but stopped answering /health (${TRIAL_DELIVERED}/${TRIAL_SENT} delivered)" >&2 ;;
     over-budget) fail "${tag} trial ${i}: request line over the header budget, answered 431." ;;
     undelivered) fail "${tag} trial ${i}: only ${TRIAL_DELIVERED}/${TRIAL_SENT} requests reached the app." ;;
     *) fail "${tag} trial ${i}: ${TRIAL_VERDICT}." ;;
@@ -309,29 +324,56 @@ repeat() {
 # apart are recognised one at a time and collected one at a time. A search that
 # skips counts cannot find a window it steps over, so this climbs.
 #
-# MAX_CONCURRENCY bounds the climb. PROBE_C is gone.
+# MAX_CONCURRENCY bounds the climb. It has to sit above every count the tables
+# publish, or the documented command cannot reach the cell it is cited for.
 first_oom() {
-  local tag="$1" max="${MAX_CONCURRENCY:-16}" count
+  local tag="$1" max="${MAX_CONCURRENCY:-64}" count
 
   # START_C continues a climb whose lower counts are already on record. It is
   # not a shortcut past them: skipping counts that were never tried is what the
   # ceiling probe did, and it stepped over the fatal window.
+  local attempt
   for ((count = "${START_C:-1}"; count <= max; count++)); do
-    trial candidate "$count" "$EVIDENCE/${tag}-x${count}.log"
+    # A rung that delivered nothing gets one retry. Docker DNS occasionally fails
+    # to resolve the worker on a fresh container, which is transient and not the
+    # victim's doing; a second failure is not transient and stops the climb
+    # rather than being counted as a rung the worker survived.
+    for attempt in 1 2; do
+      trial candidate "$count" "$EVIDENCE/${tag}-x${count}.log"
+      [[ "$TRIAL_VERDICT" == undelivered && "$attempt" == 1 ]] || break
+      echo "[retry] x${count}: ${TRIAL_DELIVERED}/${TRIAL_SENT} delivered, /health ${TRIAL_HEALTH}. Retrying once." >&2
+    done
     case "$TRIAL_VERDICT" in
     fatal) echo "$count"; return ;;
     healthy) ;;
+    stalled) echo "[stalled] x${count}: alive but stopped answering /health (${TRIAL_DELIVERED}/${TRIAL_SENT} delivered)" >&2 ;;
     over-budget) fail "${tag} x${count}: request line over the header budget, answered 431." ;;
-    undelivered) fail "${tag} x${count}: only ${TRIAL_DELIVERED}/${TRIAL_SENT} requests reached the app." ;;
+    undelivered) fail "${tag} x${count}: only ${TRIAL_DELIVERED}/${TRIAL_SENT} requests reached the app, /health ${TRIAL_HEALTH}. Twice." ;;
     *) fail "${tag} x${count}: ${TRIAL_VERDICT}." ;;
     esac
   done
   echo "survives $max"
 }
 
+# stock | 70933 | zero-segment | both | ungate | count
+#
+# The two fixes are separate scripts with separate switches, so they compose:
+# "both" is not a third patch, it is the two of them applied to the same bundle.
+# ungate and count are proof-only edits and go through patch-router.mjs instead.
 build_app() {
-  ROUTER_PATCH="$1" BUILD_CONFIG="${2:-production}" docker compose build app >/dev/null 2>&1 ||
-    fail "build with ROUTER_PATCH=$1 BUILD_CONFIG=${2:-production} failed."
+  local variant="$1" cfg="${2:-production}"
+  local rp=none p9=0 pz=0
+  case "$variant" in
+  stock | none) ;;
+  70933) p9=1 ;;
+  zero-segment) pz=1 ;;
+  both) p9=1 pz=1 ;;
+  ungate | count) rp="$variant" ;;
+  *) fail "unknown build variant: $variant" ;;
+  esac
+  ROUTER_PATCH="$rp" PATCH_70933="$p9" PATCH_ZERO_SEGMENT="$pz" BUILD_CONFIG="$cfg"     docker compose build app >/dev/null 2>&1 ||
+    fail "build of variant $variant (config $cfg) failed."
+  export ROUTER_PATCH="$rp" PATCH_70933="$p9" PATCH_ZERO_SEGMENT="$pz" BUILD_VARIANT="$variant"
 }
 
 # Reads the simulated internal service over the lab network, using the client
@@ -360,16 +402,38 @@ dashboard)
   # replaying one per level.
   export HEAP_MB="${HEAP_MB:-256}" SHAPE="${SHAPE:-nested3}"
   export BRANCHES="${BRANCHES:-2}" DEPTH="${DEPTH:-9}" OUTLET=detail PRIM=0
-  export SERVICES=app TARGET_URL=http://app:4000 CONCURRENCY="${CONCURRENCY:-4}"
-  echo "== ${SHAPE} | heap ${HEAP_MB} MiB | b=${BRANCHES} d=${DEPTH} | ${CONCURRENCY} requests =="
+  export SERVICES=app TARGET_URL=http://app:4000
+  echo "== ${SHAPE} | heap ${HEAP_MB} MiB | b=${BRANCHES} d=${DEPTH} =="
 
-  trial control "$CONCURRENCY" evidence/dashboard-control.log
-  [[ "$TRIAL_VERDICT" == healthy ]] || fail "Control was $TRIAL_VERDICT."
-  echo "[PASS] control:   worker survived. ${TRIAL_BYTES} B, /health ${TRIAL_BLOCK} ms, peak ${TRIAL_PEAK} MiB."
+  # One request each, first. This is the part that needs no burst and no count:
+  # same bytes, same groups, and the candidate blocks the worker while the
+  # control does not. An earlier revision asserted an OOM at a fixed count
+  # instead, which is a threshold, and the arm failed whenever the machine
+  # needed one more request than the number that was hardcoded.
+  trial control 1 "$EVIDENCE/dashboard-control.log"
+  [[ "$TRIAL_VERDICT" == healthy ]] || fail "Control was $TRIAL_VERDICT at one request."
+  control_bytes="$TRIAL_BYTES"
+  control_block="$TRIAL_BLOCK"
+  echo "[PASS] control:   ${TRIAL_BYTES} B, /health ${TRIAL_BLOCK} ms, peak ${TRIAL_PEAK} MiB."
 
-  trial candidate "$CONCURRENCY" evidence/dashboard-candidate.log
-  [[ "$TRIAL_VERDICT" == fatal ]] || fail "Candidate was $TRIAL_VERDICT (/health ${TRIAL_BLOCK} ms, peak ${TRIAL_PEAK} MiB)."
-  echo "[PASS] candidate: V8 heap limit reached, worker gone, OOMKilled=false. ${TRIAL_BYTES} B."
+  trial candidate 1 "$EVIDENCE/dashboard-candidate.log"
+  [[ "$TRIAL_BYTES" == "$control_bytes" ]] ||
+    fail "Not byte-identical: candidate ${TRIAL_BYTES} B, control ${control_bytes} B."
+  [[ "$TRIAL_BLOCK" != "n/a" && "$control_block" != "n/a" ]] ||
+    fail "No /health timing to compare."
+  ((TRIAL_BLOCK > control_block * 10)) ||
+    fail "Candidate blocked ${TRIAL_BLOCK} ms against the control's ${control_block} ms; expected far worse."
+  echo "[PASS] candidate: same ${TRIAL_BYTES} B, /health ${TRIAL_BLOCK} ms against ${control_block} ms, peak ${TRIAL_PEAK} MiB."
+
+  # Then the burst, climbing rather than guessing. Prints the count; does not
+  # depend on it being any particular number.
+  first="$(first_oom dashboard)"
+  [[ "$first" =~ ^[0-9]+$ ]] || fail "Worker survived every count up to ${MAX_CONCURRENCY:-64}."
+  echo "[PASS] candidate: V8 heap limit at ${first} concurrent requests, OOMKilled=false."
+
+  trial control "$first" "$EVIDENCE/dashboard-control-x${first}.log"
+  [[ "$TRIAL_VERDICT" == healthy ]] || fail "Control was $TRIAL_VERDICT at ${first} requests."
+  echo "[PASS] control:   survived ${first} of the same-length requests."
   ;;
 
 ladder)
@@ -484,27 +548,24 @@ devprod)
   ;;
 
 ablation)
-  # Each proof-only edit on its own, against the same bytes and the same URL.
-  # "ungate" calls checkOutletNameUniqueness() in production. "share-query" is
-  # angular/angular#70933, included to show what it does and does not reach.
+  # Each change on its own, against the same bytes and the same URL. 70933 is
+  # angular/angular#70933, included to show what it does not reach. ungate is the
+  # one-line ablation: it closes the nested replay only. zero-segment is the fix.
   export HEAP_MB="${HEAP_MB:-256}" SHAPE="${SHAPE:-nested3}"
   export BRANCHES="${BRANCHES:-2}" DEPTH="${DEPTH:-9}" OUTLET=detail PRIM=0
   export SERVICES=app TARGET_URL=http://app:4000 CONCURRENCY="${CONCURRENCY:-4}"
   echo "== ablation | heap ${HEAP_MB} MiB | ${SHAPE} | ${CONCURRENCY} requests | ${TRIALS} fresh workers per build =="
   printf '%-14s %-14s %-11s %-12s %-10s %s\n' build outcome "median ms" "/health ms" "peak MiB" status
 
-  for patch in none share-query ungate; do
+  for patch in ${VARIANTS:-stock 70933 ungate zero-segment}; do
     build_app "$patch"
-    export ROUTER_PATCH="$patch"
     repeat candidate "$CONCURRENCY" "ablation-${patch}"
     label="$patch"
-    [[ "$patch" == none ]] && label="stock"
     printf '%-14s %-14s %-11s %-12s %-10s %s\n' \
       "$label" "${REPEAT_FATAL}/${TRIALS} fatal" "$REPEAT_MS" "$REPEAT_BLOCK" \
       "$REPEAT_PEAK" "$REPEAT_STATUS"
   done
-  export ROUTER_PATCH=none
-  build_app none
+  build_app stock
   ;;
 
 guard)
@@ -626,8 +687,65 @@ probe)
   printf '%-8s %-10s %-6s %-6s %s\n' \
     "${HEAP_MB}M" "$SHAPE" "x${C}" "$TRIAL_BYTES" "$TRIAL_VERDICT"
   ;;
+resources)
+  # withRouterResources(), the second way to reach the same missing check. The
+  # URL here is flat - distinct outlet names, no nesting - and the duplicated
+  # siblings are manufactured by mergeEmptyPathMatches() one level below where
+  # checkOutletNameUniqueness() runs, so ungating alone does not close it.
+  #
+  # The feature is developer preview and opt-in; ROUTER_RESOURCES=1 is read at
+  # runtime by app.config.ts, so the same image serves both columns.
+  export ROUTER_RESOURCES=1 FLAT_ROOT=1 SHAPE="" OUTLET=a PRIM=0 NO_SEP=0
+  export SERVICES=app TARGET_URL=http://app:4000
+  echo "== resources | withRouterResources() | flat URL, distinct outlet names =="
+  printf '%-10s %-8s %-8s %s\n' outlets heap patch "requests to OOM"
+
+  for patch in ${VARIANTS:-stock 70933 zero-segment}; do
+    build_app "$patch"
+    for outlets in ${OUTLETS:-1246 2400}; do
+      export FLAT="$outlets"
+      for heap in ${HEAPS:-256 512}; do
+        export HEAP_MB="$heap"
+        printf '%-10s %-8s %-8s %s\n' "$outlets" "${heap}M" "$patch" \
+          "$(first_oom "resources-${outlets}-${heap}-${patch}")"
+      done
+    done
+  done
+  export ROUTER_RESOURCES=0
+  build_app stock
+  ;;
+
+fixcheck)
+  # The two fixes against the same attack, and the question a maintainer asks
+  # first: does an ordinary URL still render the same page. stock is unpatched,
+  # 70933 is angular/angular#70933, zero-segment is the proposed fix, both is the
+  # two of them on the same bundle.
+  export HEAP_MB="${HEAP_MB:-256}" SHAPE="${SHAPE:-nested3}"
+  export BRANCHES="${BRANCHES:-2}" DEPTH="${DEPTH:-9}" OUTLET=detail PRIM=0
+  export SERVICES=app TARGET_URL=http://app:4000 CONCURRENCY="${CONCURRENCY:-4}"
+  echo "== fixcheck | heap ${HEAP_MB} MiB | ${SHAPE} | ${CONCURRENCY} requests =="
+  printf '%-14s %-12s %-10s %-12s %s
+' build attack "peak MiB" "/health ms" "ordinary URL"
+
+  for variant in ${VARIANTS:-stock 70933 zero-segment both}; do
+    build_app "$variant"
+    trial candidate "$CONCURRENCY" "$EVIDENCE/fixcheck-${variant}.log"
+    attack="$TRIAL_STATUS"
+    [[ "$TRIAL_VERDICT" == fatal ]] && attack="V8 OOM"
+    apeak="$TRIAL_PEAK"
+    ablock="$TRIAL_BLOCK"
+
+    # A legal URL through the same build: one group, one route, the page a real
+    # user asks for. Its bytes are what a regression would move.
+    DEPTH=0 BRANCHES=1 trial control 1 "$EVIDENCE/fixcheck-${variant}-ordinary.log"
+    printf '%-14s %-12s %-10s %-12s %s
+'       "$variant" "$attack" "$apeak" "$ablock" "${TRIAL_STATUS} sha ${TRIAL_SHA:0:16}"
+  done
+  build_app stock
+  ;;
+
 *)
-  echo "Usage: $0 [dashboard|ladder|fuzz|counts|devprod|ablation|guard|matrix|backend|probe]" >&2
+  echo "Usage: $0 [dashboard|ladder|fuzz|counts|devprod|ablation|guard|matrix|backend|probe|resources|fixcheck]" >&2
   exit 2
   ;;
 esac
